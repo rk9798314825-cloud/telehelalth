@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 const api = axios.create({
-  baseURL: 'https://your-url.up.railway.app/api'
+  baseURL: 'https://telemedicine-project-production-8bf7.up.railway.app/api'
 });
 
 api.interceptors.request.use(cfg => {
