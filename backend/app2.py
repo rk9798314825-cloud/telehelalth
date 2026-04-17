@@ -1,7 +1,10 @@
 import os
 import io
+import time
 import json
 import numpy as np
+import pydicom
+from PIL import Image
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -45,12 +48,9 @@ def ai_analyze(symptoms_text):
             "suggestions": ["Book an appointment with a doctor", "Describe symptoms in detail"],
             "tests": ["General Health Checkup"], "specialist": "General Physician", "urgency": "low"
         }
-    # Combine results - pick highest urgency
     urgency_order = {"high": 3, "medium": 2, "low": 1}
     results.sort(key=lambda x: urgency_order.get(x["urgency"], 0), reverse=True)
-    all_suggestions = []
-    all_tests = []
-    specialists = []
+    all_suggestions, all_tests, specialists = [], [], []
     for r in results:
         all_suggestions.extend(r["suggestions"])
         all_tests.extend(r["tests"])
@@ -136,7 +136,7 @@ def get_appointments():
 def respond_appointment(aid):
     data = request.json
     apt = Appointment.query.get_or_404(aid)
-    apt.status = data['status']  # accepted / rejected
+    apt.status = data['status']
     if data.get('notes'):
         apt.doctor_notes = data['notes']
     if data.get('suggested_test'):
@@ -185,7 +185,7 @@ def accept_test_request(tid):
     db.session.commit()
     return jsonify(test_request=tr.to_dict())
 
-# ─── DICOM UPLOAD & VIEW ──────────────────────────────────
+# ─── DICOM ROUTES ─────────────────────────────────────────
 @app.route('/api/dicom/upload', methods=['POST'])
 @jwt_required()
 def upload_dicom():
@@ -201,15 +201,17 @@ def upload_dicom():
     patient_id = request.form.get('patient_id')
     findings = request.form.get('findings', '')
 
-    import time
     fname = f"{int(time.time())}_{f.filename}"
     fpath = os.path.join(app.config['UPLOAD_FOLDER'], fname)
     f.save(fpath)
 
     report = DicomReport(
         test_request_id=int(test_request_id) if test_request_id else None,
-        patient_id=int(patient_id), uploaded_by=uid,
-        filename=fname, filepath=fpath, findings=findings
+        patient_id=int(patient_id),
+        uploaded_by=uid,
+        filename=fname,
+        filepath=fpath,
+        findings=findings
     )
     db.session.add(report)
 
@@ -221,11 +223,13 @@ def upload_dicom():
     db.session.commit()
     return jsonify(report=report.to_dict()), 201
 
+
 @app.route('/api/dicom/reports', methods=['GET'])
 @jwt_required()
 def get_reports():
     uid = int(get_jwt_identity())
     u = User.query.get(uid)
+
     if u.role == 'patient':
         reports = DicomReport.query.filter_by(patient_id=uid).all()
     elif u.role == 'pathologist':
@@ -233,60 +237,80 @@ def get_reports():
     else:
         patient_ids = [a.patient_id for a in Appointment.query.filter_by(doctor_id=uid).all()]
         reports = DicomReport.query.filter(DicomReport.patient_id.in_(patient_ids)).all()
+
     return jsonify(reports=[r.to_dict() for r in reports])
+
 
 @app.route('/api/dicom/view/<int:rid>', methods=['GET'])
 @jwt_required()
 def view_dicom(rid):
     report = DicomReport.query.get_or_404(rid)
     try:
-        import pydicom
-        from PIL import Image
+        if not os.path.exists(report.filepath):
+             # fallback demo file
+         demo_path = os.path.join(app.config['UPLOAD_FOLDER'], 'sample.dcm')
+    
+        if not os.path.exists(demo_path):
+             return jsonify(error="No DICOM file available on server"), 500
+    
+        report.filepath = demo_path  
 
         ds = pydicom.dcmread(report.filepath)
+
+        if 'PixelData' not in ds:
+            return jsonify(error="No pixel data in DICOM file"), 400
+
         pixel_array = ds.pixel_array.astype(float)
+
+        if pixel_array.max() == pixel_array.min():
+            return jsonify(error="Invalid image data: uniform pixel values"), 400
+
         pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min()) * 255
         pixel_array = pixel_array.astype(np.uint8)
 
-        img = Image.fromarray(pixel_array)
+        if pixel_array.ndim == 2:
+            img = Image.fromarray(pixel_array, mode='L')
+        elif pixel_array.ndim == 3:
+            img = Image.fromarray(pixel_array, mode='RGB')
+        else:
+            return jsonify(error="Unsupported pixel array dimensions"), 400
+
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
 
-        metadata = {
-            'PatientName': str(getattr(ds, 'PatientName', 'N/A')),
-            'Modality': str(getattr(ds, 'Modality', 'N/A')),
-            'StudyDate': str(getattr(ds, 'StudyDate', 'N/A')),
-            'BodyPart': str(getattr(ds, 'BodyPartExamined', 'N/A')),
-            'Rows': str(getattr(ds, 'Rows', 'N/A')),
-            'Columns': str(getattr(ds, 'Columns', 'N/A')),
-        }
-        return send_file(buf, mimetype='image/png',
-                        download_name=f"dicom_{rid}.png",
-                        as_attachment=False)
+        return send_file(buf, mimetype='image/png')
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # ✅ shows full error in terminal
         return jsonify(error=f'Cannot render DICOM: {str(e)}'), 500
+
 
 @app.route('/api/dicom/metadata/<int:rid>', methods=['GET'])
 @jwt_required()
 def dicom_metadata(rid):
     report = DicomReport.query.get_or_404(rid)
     try:
-        import pydicom
+        if not os.path.exists(report.filepath):
+            return jsonify(error="File not found on server"), 404
+
         ds = pydicom.dcmread(report.filepath)
+
         meta = {
-            'PatientName': str(getattr(ds, 'PatientName', 'N/A')),
-            'PatientID': str(getattr(ds, 'PatientID', 'N/A')),
-            'Modality': str(getattr(ds, 'Modality', 'N/A')),
-            'StudyDate': str(getattr(ds, 'StudyDate', 'N/A')),
+            'PatientName':      str(getattr(ds, 'PatientName',      'N/A')),
+            'PatientID':        str(getattr(ds, 'PatientID',        'N/A')),
+            'Modality':         str(getattr(ds, 'Modality',         'N/A')),
+            'StudyDate':        str(getattr(ds, 'StudyDate',        'N/A')),
             'StudyDescription': str(getattr(ds, 'StudyDescription', 'N/A')),
             'BodyPartExamined': str(getattr(ds, 'BodyPartExamined', 'N/A')),
-            'Rows': int(getattr(ds, 'Rows', 0)),
-            'Columns': int(getattr(ds, 'Columns', 0)),
-            'BitsAllocated': int(getattr(ds, 'BitsAllocated', 0)),
-            'findings': report.findings
+            'Rows':             int(getattr(ds, 'Rows',             0)),
+            'Columns':          int(getattr(ds, 'Columns',          0)),
+            'BitsAllocated':    int(getattr(ds, 'BitsAllocated',    0)),
+            'findings':         report.findings
         }
         return jsonify(metadata=meta)
+
     except Exception as e:
         return jsonify(error=str(e)), 500
 
@@ -297,6 +321,7 @@ def analyze_symptoms():
     data = request.json
     result = ai_analyze(data.get('symptoms', ''))
     return jsonify(result=result)
+
 @app.route("/")
 def home():
     return "Telemedicine Backend Running"
@@ -305,12 +330,13 @@ def home():
 def seed():
     if User.query.count() == 0:
         users = [
-            ('patient@test.com', 'Patient User', 'patient', None),
-            ('doctor@test.com', 'Dr. Smith', 'doctor', 'General Medicine'),
-            ('cardio@test.com', 'Dr. Heart', 'doctor', 'Cardiology'),
-            ('neuro@test.com', 'Dr. Brain', 'doctor', 'Neurology'),
-            ('path@test.com', 'Lab Tech Alice', 'pathologist', 'Radiology'),
-            ('path2@test.com', 'Lab Tech Bob', 'pathologist', 'Pathology'),
+            ('patient@test.com',  'Patient User',    'patient',     None),
+            ('patient2@test.com', 'Patient2 User',   'patient',     None),
+            ('doctor@test.com',   'Dr. Smith',        'doctor',      'General Medicine'),
+            ('cardio@test.com',   'Dr. Heart',        'doctor',      'Cardiology'),
+            ('neuro@test.com',    'Dr. Brain',        'doctor',      'Neurology'),
+            ('path@test.com',     'Lab Tech Alice',   'pathologist', 'Radiology'),
+            ('path2@test.com',    'Lab Tech Bob',     'pathologist', 'Pathology'),
         ]
         for email, name, role, spec in users:
             u = User(email=email, name=name, role=role, specialization=spec)
