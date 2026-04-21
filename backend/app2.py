@@ -4,6 +4,9 @@ import time
 import json
 import numpy as np
 import pydicom
+import cloudinary
+import cloudinary.uploader
+import requests
 from PIL import Image
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -12,6 +15,11 @@ from models import db, User, Appointment, TestRequest, DicomReport
 from datetime import datetime
 
 app = Flask(__name__)
+cloudinary.config(
+    cloud_name=os.getenv("CLOUD_NAME"),
+    api_key=os.getenv("API_KEY"),
+    api_secret=os.getenv("API_SECRET")
+)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///telemedicine.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'super-secret-key-change-this'
@@ -202,15 +210,18 @@ def upload_dicom():
     findings = request.form.get('findings', '')
 
     fname = f"{int(time.time())}_{f.filename}"
-    fpath = os.path.join(app.config['UPLOAD_FOLDER'], fname)
-    f.save(fpath)
+    upload_result = cloudinary.uploader.upload(
+    f,
+    resource_type="raw"   # important for .dcm
+    )
+    file_url = upload_result["secure_url"]
 
     report = DicomReport(
         test_request_id=int(test_request_id) if test_request_id else None,
         patient_id=int(patient_id),
         uploaded_by=uid,
         filename=fname,
-        filepath=fpath,
+        filepath=file_url,
         findings=findings
     )
     db.session.add(report)
@@ -244,18 +255,18 @@ def get_reports():
 @app.route('/api/dicom/view/<int:rid>', methods=['GET'])
 @jwt_required()
 def view_dicom(rid):
-    report = DicomReport.query.get_or_404(rid)
     try:
-        if not os.path.exists(report.filepath):
-             # fallback demo file
-         demo_path = os.path.join(app.config['UPLOAD_FOLDER'], 'sample.dcm')
-    
-        if not os.path.exists(demo_path):
-             return jsonify(error="No DICOM file available on server"), 500
-    
-        report.filepath = demo_path  
+        report = DicomReport.query.get_or_404(rid)
 
-        ds = pydicom.dcmread(report.filepath)
+        # ✅ fetch DICOM from Cloudinary URL
+        response = requests.get(report.filepath,timeout=10)
+
+        if response.status_code != 200:
+            return jsonify(error="Failed to fetch DICOM file"), 500
+
+        ds = pydicom.dcmread(io.BytesIO(response.content))
+        if not hasattr(ds, "pixel_array"):
+            return jsonify(error="Invalid DICOM file"), 400
 
         if 'PixelData' not in ds:
             return jsonify(error="No pixel data in DICOM file"), 400
@@ -263,17 +274,19 @@ def view_dicom(rid):
         pixel_array = ds.pixel_array.astype(float)
 
         if pixel_array.max() == pixel_array.min():
-            return jsonify(error="Invalid image data: uniform pixel values"), 400
+            return jsonify(error="Invalid image data"), 400
 
+        # normalize
         pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min()) * 255
         pixel_array = pixel_array.astype(np.uint8)
 
+        # convert to image
         if pixel_array.ndim == 2:
-            img = Image.fromarray(pixel_array, mode='L')
+            img = Image.fromarray(pixel_array)
         elif pixel_array.ndim == 3:
-            img = Image.fromarray(pixel_array, mode='RGB')
+            img = Image.fromarray(pixel_array)
         else:
-            return jsonify(error="Unsupported pixel array dimensions"), 400
+            return jsonify(error="Unsupported image format"), 400
 
         buf = io.BytesIO()
         img.save(buf, format='PNG')
@@ -283,32 +296,37 @@ def view_dicom(rid):
 
     except Exception as e:
         import traceback
-        traceback.print_exc()   # ✅ shows full error in terminal
-        return jsonify(error=f'Cannot render DICOM: {str(e)}'), 500
-
-
+        traceback.print_exc()
+        return jsonify(error=f"Cannot render DICOM: {str(e)}"), 500
 @app.route('/api/dicom/metadata/<int:rid>', methods=['GET'])
 @jwt_required()
 def dicom_metadata(rid):
-    report = DicomReport.query.get_or_404(rid)
     try:
-        if not os.path.exists(report.filepath):
-            return jsonify(error="File not found on server"), 404
+        report = DicomReport.query.get_or_404(rid)
 
-        ds = pydicom.dcmread(report.filepath)
+        # ✅ fetch from cloud
+        response = requests.get(report.filepath)
+
+        if response.status_code != 200:
+            return jsonify(error="Failed to fetch DICOM"), 500
+
+        ds = pydicom.dcmread(io.BytesIO(response.content))
+        if not hasattr(ds, "pixel_array"):
+           return jsonify(error="Invalid DICOM file"), 400
 
         meta = {
-            'PatientName':      str(getattr(ds, 'PatientName',      'N/A')),
-            'PatientID':        str(getattr(ds, 'PatientID',        'N/A')),
-            'Modality':         str(getattr(ds, 'Modality',         'N/A')),
-            'StudyDate':        str(getattr(ds, 'StudyDate',        'N/A')),
+            'PatientName':      str(getattr(ds, 'PatientName', 'N/A')),
+            'PatientID':        str(getattr(ds, 'PatientID', 'N/A')),
+            'Modality':         str(getattr(ds, 'Modality', 'N/A')),
+            'StudyDate':        str(getattr(ds, 'StudyDate', 'N/A')),
             'StudyDescription': str(getattr(ds, 'StudyDescription', 'N/A')),
             'BodyPartExamined': str(getattr(ds, 'BodyPartExamined', 'N/A')),
-            'Rows':             int(getattr(ds, 'Rows',             0)),
-            'Columns':          int(getattr(ds, 'Columns',          0)),
-            'BitsAllocated':    int(getattr(ds, 'BitsAllocated',    0)),
+            'Rows':             int(getattr(ds, 'Rows', 0)),
+            'Columns':          int(getattr(ds, 'Columns', 0)),
+            'BitsAllocated':    int(getattr(ds, 'BitsAllocated', 0)),
             'findings':         report.findings
         }
+
         return jsonify(metadata=meta)
 
     except Exception as e:
