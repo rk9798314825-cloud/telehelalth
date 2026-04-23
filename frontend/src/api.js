@@ -4,7 +4,7 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
 const api = axios.create({
   baseURL: isLocal 
     ? 'http://127.0.0.1:7000/api' 
-    : 'https://telehelalth-production.up.railway.app/api' // Replace with your actual Railway URL once deployed
+    : 'https://telemed-backend-cylv.onrender.com/api'
 });
 
 api.interceptors.request.use(cfg => {
