@@ -1,7 +1,10 @@
 import axios from 'axios';
 
+const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
 const api = axios.create({
-  baseURL: 'http://127.0.0.1:7000/api'
+  baseURL: isLocal 
+    ? 'http://127.0.0.1:7000/api' 
+    : 'https://telehelalth-production.up.railway.app/api' // Replace with your actual Railway URL once deployed
 });
 
 api.interceptors.request.use(cfg => {
