@@ -83,22 +83,53 @@ export default function DicomViewer({ reportId, findings }) {
     setLoading(true);
     setError('');
     try {
-      const [imgRes, metaRes] = await Promise.all([
-        api.get('/dicom/view/' + reportId, { responseType: 'blob' }),
-        api.get('/dicom/metadata/' + reportId)
-      ]);
+      // Fetch image and metadata separately so a metadata failure
+      // doesn't prevent the image from loading
+      let imgRes;
+      try {
+        imgRes = await api.get('/dicom/view/' + reportId, { responseType: 'blob' });
+      } catch (imgErr) {
+        // When responseType is 'blob', error response data is a Blob
+        // that needs to be parsed as JSON to get the actual error message
+        let errorMsg = 'Failed to load DICOM image';
+        if (imgErr.response?.data instanceof Blob) {
+          try {
+            const text = await imgErr.response.data.text();
+            const json = JSON.parse(text);
+            errorMsg = json.error || errorMsg;
+          } catch (_) { /* ignore parse errors */ }
+        } else if (imgErr.response?.data?.error) {
+          errorMsg = imgErr.response.data.error;
+        }
+        setError(errorMsg);
+        setLoading(false);
+        return;
+      }
+
       const url = URL.createObjectURL(imgRes.data);
       setImgUrl(url);
-      setMetadata(metaRes.data.metadata);
+
+      // Load metadata separately — don't block image display if it fails
+      try {
+        const metaRes = await api.get('/dicom/metadata/' + reportId);
+        setMetadata(metaRes.data.metadata);
+      } catch (metaErr) {
+        console.warn('Could not load DICOM metadata:', metaErr);
+        setMetadata(null);
+      }
 
       const img = new Image();
       img.onload = () => {
         imageRef.current = img;
         initCanvas(img);
       };
+      img.onerror = () => {
+        setError('Failed to decode image data');
+      };
       img.src = url;
     } catch (e) {
-      setError(e.response?.data?.error || 'Failed to load DICOM');
+      setError('Failed to load DICOM viewer');
+      console.error('DICOM load error:', e);
     }
     setLoading(false);
   };
@@ -609,7 +640,11 @@ export default function DicomViewer({ reportId, findings }) {
   if (error) return (
     <div className="card text-center py-10">
       <div className="text-4xl mb-2">⚠️</div>
-      <p className="text-red-600">{error}</p>
+      <p className="text-red-600 font-medium mb-1">DICOM Load Error</p>
+      <p className="text-red-500 text-sm mb-4">{error}</p>
+      <button onClick={loadDicom} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">
+        🔄 Retry
+      </button>
     </div>
   );
 

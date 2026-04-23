@@ -1,0 +1,20 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+instance/
+backend/telemedicine.db
+backend/uploads/
+
+# Node
+node_modules/
+frontend/node_modules/
+.eslintcache
+
+# Environment
+.env
+backend/.env
+
+# OS
+.DS_Store
+Thumbs.db

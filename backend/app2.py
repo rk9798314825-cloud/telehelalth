@@ -2,8 +2,10 @@ import os
 import io
 import time
 import json
+import traceback
 import numpy as np
 import pydicom
+from pydicom.pixel_data_handlers.util import apply_modality_lut, apply_voi_lut
 import cloudinary
 import cloudinary.uploader
 import requests
@@ -13,13 +15,24 @@ from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from models import db, User, Appointment, TestRequest, DicomReport
 from datetime import datetime
-
+from dotenv import load_dotenv
+load_dotenv()
 app = Flask(__name__)
-cloudinary.config(
-    cloud_name=os.getenv("CLOUD_NAME"),
-    api_key=os.getenv("API_KEY"),
-    api_secret=os.getenv("API_SECRET")
-)
+
+# Strip whitespace from env vars to avoid common config errors
+CLOUD_NAME = os.getenv("CLOUD_NAME", "").strip()
+API_KEY = os.getenv("API_KEY", "").strip()
+API_SECRET = os.getenv("API_SECRET", "").strip()
+
+if CLOUD_NAME and API_KEY and API_SECRET:
+    cloudinary.config(
+        cloud_name=CLOUD_NAME,
+        api_key=API_KEY,
+        api_secret=API_SECRET
+    )
+else:
+    print("WARNING: Cloudinary not fully configured. Falling back to local storage.")
+
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///telemedicine.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'super-secret-key-change-this'
@@ -210,11 +223,26 @@ def upload_dicom():
     findings = request.form.get('findings', '')
 
     fname = f"{int(time.time())}_{f.filename}"
-    upload_result = cloudinary.uploader.upload(
-    f,
-    resource_type="raw"   # important for .dcm
-    )
-    file_url = upload_result["secure_url"]
+    file_url = ""
+
+    # Try Cloudinary first
+    if CLOUD_NAME and API_KEY and API_SECRET:
+        try:
+            f.seek(0)
+            upload_result = cloudinary.uploader.upload(f, resource_type="raw")
+            file_url = upload_result["secure_url"]
+            print(f"Uploaded to Cloudinary: {file_url}")
+        except Exception as e:
+            print(f"Cloudinary upload failed: {e}. Falling back to local storage.")
+
+    # Local fallback if Cloudinary failed or not configured
+    if not file_url:
+        f.seek(0)
+        local_path = os.path.join(app.config['UPLOAD_FOLDER'], fname)
+        f.save(local_path)
+        # We store the local absolute path or just the filename with a prefix
+        file_url = f"local://{fname}"
+        print(f"Saved locally: {local_path}")
 
     report = DicomReport(
         test_request_id=int(test_request_id) if test_request_id else None,
@@ -258,35 +286,73 @@ def view_dicom(rid):
     try:
         report = DicomReport.query.get_or_404(rid)
 
-        # ✅ fetch DICOM from Cloudinary URL
-        response = requests.get(report.filepath,timeout=10)
+        # ✅ fetch DICOM from Cloudinary or Local
+        if report.filepath.startswith('local://'):
+            fname = report.filepath.replace('local://', '')
+            lpath = os.path.join(app.config['UPLOAD_FOLDER'], fname)
+            if not os.path.exists(lpath):
+                return jsonify(error="Local file not found"), 404
+            with open(lpath, 'rb') as lf:
+                content = lf.read()
+        else:
+            response = requests.get(report.filepath, timeout=30)
+            if response.status_code != 200:
+                return jsonify(error="Failed to fetch DICOM file from storage"), 500
+            content = response.content
 
-        if response.status_code != 200:
-            return jsonify(error="Failed to fetch DICOM file"), 500
+        ds = pydicom.dcmread(io.BytesIO(content), force=True)
 
-        ds = pydicom.dcmread(io.BytesIO(response.content))
-        if not hasattr(ds, "pixel_array"):
-            return jsonify(error="Invalid DICOM file"), 400
-
+        # Check for pixel data safely (do NOT use hasattr(ds, 'pixel_array')
+        # because that triggers decompression which can crash)
         if 'PixelData' not in ds:
             return jsonify(error="No pixel data in DICOM file"), 400
 
-        pixel_array = ds.pixel_array.astype(float)
+        # Handle compressed transfer syntaxes
+        try:
+            ds.decompress()
+        except Exception:
+            pass  # Already uncompressed or handler not available
+
+        try:
+            pixel_array = ds.pixel_array.astype(float)
+        except Exception as px_err:
+            return jsonify(error=f"Cannot decode pixel data: {str(px_err)}"), 400
+
+        # For multi-frame DICOM, take the first frame
+        if pixel_array.ndim == 4:
+            pixel_array = pixel_array[0]
+        elif pixel_array.ndim == 3 and pixel_array.shape[0] > 4:
+            # Likely multi-frame grayscale (frames, rows, cols)
+            pixel_array = pixel_array[0]
 
         if pixel_array.max() == pixel_array.min():
-            return jsonify(error="Invalid image data"), 400
+            return jsonify(error="Image has no contrast (blank)"), 400
 
-        # normalize
-        pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min()) * 255
+        # Apply DICOM modality and VOI LUT for proper windowing
+        try:
+            pixel_array = apply_modality_lut(pixel_array, ds)
+        except Exception:
+            pass
+        try:
+            pixel_array = apply_voi_lut(pixel_array.astype(float), ds)
+        except Exception:
+            pass
+
+        # Normalize to 0-255
+        pmin, pmax = pixel_array.min(), pixel_array.max()
+        if pmax != pmin:
+            pixel_array = (pixel_array - pmin) / (pmax - pmin) * 255.0
         pixel_array = pixel_array.astype(np.uint8)
 
-        # convert to image
+        # Convert to PIL Image
         if pixel_array.ndim == 2:
-            img = Image.fromarray(pixel_array)
-        elif pixel_array.ndim == 3:
-            img = Image.fromarray(pixel_array)
+            img = Image.fromarray(pixel_array, mode='L')
+        elif pixel_array.ndim == 3 and pixel_array.shape[2] == 3:
+            img = Image.fromarray(pixel_array, mode='RGB')
+        elif pixel_array.ndim == 3 and pixel_array.shape[2] == 4:
+            img = Image.fromarray(pixel_array, mode='RGBA')
         else:
-            return jsonify(error="Unsupported image format"), 400
+            return jsonify(error="Unsupported image dimensions"), 400
 
         buf = io.BytesIO()
         img.save(buf, format='PNG')
@@ -295,7 +361,6 @@ def view_dicom(rid):
         return send_file(buf, mimetype='image/png')
 
     except Exception as e:
-        import traceback
         traceback.print_exc()
         return jsonify(error=f"Cannot render DICOM: {str(e)}"), 500
 @app.route('/api/dicom/metadata/<int:rid>', methods=['GET'])
@@ -304,15 +369,23 @@ def dicom_metadata(rid):
     try:
         report = DicomReport.query.get_or_404(rid)
 
-        # ✅ fetch from cloud
-        response = requests.get(report.filepath)
+        # ✅ fetch DICOM from Cloudinary or Local
+        if report.filepath.startswith('local://'):
+            fname = report.filepath.replace('local://', '')
+            lpath = os.path.join(app.config['UPLOAD_FOLDER'], fname)
+            if not os.path.exists(lpath):
+                return jsonify(error="Local file not found"), 404
+            with open(lpath, 'rb') as lf:
+                content = lf.read()
+        else:
+            response = requests.get(report.filepath, timeout=30)
+            if response.status_code != 200:
+                return jsonify(error="Failed to fetch DICOM"), 500
+            content = response.content
 
-        if response.status_code != 200:
-            return jsonify(error="Failed to fetch DICOM"), 500
-
-        ds = pydicom.dcmread(io.BytesIO(response.content))
-        if not hasattr(ds, "pixel_array"):
-           return jsonify(error="Invalid DICOM file"), 400
+        # force=True allows reading even slightly malformed files
+        # Metadata does NOT require pixel data so no pixel_array check
+        ds = pydicom.dcmread(io.BytesIO(content), force=True)
 
         meta = {
             'PatientName':      str(getattr(ds, 'PatientName', 'N/A')),
@@ -324,12 +397,14 @@ def dicom_metadata(rid):
             'Rows':             int(getattr(ds, 'Rows', 0)),
             'Columns':          int(getattr(ds, 'Columns', 0)),
             'BitsAllocated':    int(getattr(ds, 'BitsAllocated', 0)),
+            'TransferSyntax':   str(getattr(ds.file_meta, 'TransferSyntaxUID', 'N/A')) if hasattr(ds, 'file_meta') else 'N/A',
             'findings':         report.findings
         }
 
         return jsonify(metadata=meta)
 
     except Exception as e:
+        traceback.print_exc()
         return jsonify(error=str(e)), 500
 
 # ─── AI ENDPOINT ───────────────────────────────────────────
