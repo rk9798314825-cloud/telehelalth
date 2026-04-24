@@ -38,6 +38,11 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'super-secret-key-change-this'
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), 'uploads')
 
+# Simple in-memory cache for processed DICOM images
+# Stores: report_id -> { "content": bytes, "timestamp": float }
+dicom_cache = {}
+CACHE_LIMIT = 50 # Max images to keep in memory
+
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 JWTManager(app)
 db.init_app(app)
@@ -280,9 +285,14 @@ def get_reports():
     return jsonify(reports=[r.to_dict() for r in reports])
 
 
-@app.route('/api/dicom/view/<int:rid>', methods=['GET'])
+@app.route('/api/dicom/view/<int:rid>')
 @jwt_required()
 def view_dicom(rid):
+    # ⚡ Check Cache First
+    if rid in dicom_cache:
+        print(f"⚡ Serving DICOM {rid} from Cache")
+        return send_file(io.BytesIO(dicom_cache[rid]['content']), mimetype='image/png')
+
     try:
         report = DicomReport.query.get_or_404(rid)
 
@@ -354,15 +364,28 @@ def view_dicom(rid):
         else:
             return jsonify(error="Unsupported image dimensions"), 400
 
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
+        img_io = io.BytesIO()
+        img.save(img_io, format='PNG')
+        img_io.seek(0)
+        png_content = img_io.read()
 
-        return send_file(buf, mimetype='image/png')
+        # ⚡ Store in Cache
+        if len(dicom_cache) >= CACHE_LIMIT:
+            # Remove oldest entry if limit reached
+            oldest_rid = min(dicom_cache.keys(), key=lambda k: dicom_cache[k]['timestamp'])
+            del dicom_cache[oldest_rid]
+        
+        dicom_cache[rid] = {
+            'content': png_content,
+            'timestamp': time.time()
+        }
+
+        return send_file(io.BytesIO(png_content), mimetype='image/png')
 
     except Exception as e:
         traceback.print_exc()
         return jsonify(error=f"Cannot render DICOM: {str(e)}"), 500
+
 @app.route('/api/dicom/metadata/<int:rid>', methods=['GET'])
 @jwt_required()
 def dicom_metadata(rid):
